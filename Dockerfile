@@ -21,5 +21,9 @@ ENV PYTHONPATH=/app/src
 
 COPY data/ ./data/
 COPY outputs/modell.joblib ./outputs/modell.joblib
+COPY outputs/matvarden.json ./outputs/matvarden.json
 
-CMD ["python", "-m", "churn.score"]
+EXPOSE 8000
+
+# Listen on all container network interfaces.
+CMD ["uvicorn", "churn.api:app", "--host", "0.0.0.0", "--port", "8000"]
