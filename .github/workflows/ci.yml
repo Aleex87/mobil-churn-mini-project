@@ -50,6 +50,7 @@ jobs:
           filters: |
             ci:
               - 'src/**'
+              - 'k8s/**'
               - 'data/**'
               - 'tests/**'
               - 'kontroller/**'
