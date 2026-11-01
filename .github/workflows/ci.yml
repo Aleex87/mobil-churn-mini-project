@@ -355,6 +355,113 @@ jobs:
           print("PASS: Published image supports linux/amd64 and linux/arm64")
           PY
 
+  staging:
+    name: Deploy to kind (staging)
+    needs: image_manifest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+
+    env:
+      REPOSITORY: ${{ github.repository }}
+      EXPECTED_SHA: ${{ github.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # This cluster exists only for the current CI job.
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: staging
+          wait: 120s
+
+      - name: Pull the published image into kind
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}:$EXPECTED_SHA"
+          docker exec staging-control-plane crictl pull "$IMAGE"
+
+      - name: Deploy the tested version
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}:$EXPECTED_SHA"
+
+          # Replace the image before applying the Deployment.
+          kubectl --context kind-staging set image --local \
+            -f k8s/deployment.yaml api="$IMAGE" -o yaml \
+            | kubectl --context kind-staging apply -f -
+
+          kubectl --context kind-staging apply -f k8s/service.yaml
+          kubectl --context kind-staging rollout status deployment/saldes --timeout=180s
+
+      - name: Verify health and prediction in Kubernetes
+        run: |
+          kubectl --context kind-staging port-forward service/saldes 18080:80 \
+            > "$RUNNER_TEMP/port-forward.log" 2>&1 &
+          FORWARD_PID=$!
+          trap 'kill "$FORWARD_PID" 2>/dev/null || true' EXIT
+
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import time
+          from urllib.error import URLError
+          from urllib.request import Request, urlopen
+
+          base = "http://127.0.0.1:18080"
+          expected = os.environ["EXPECTED_SHA"]
+
+          for attempt in range(30):
+              try:
+                  with urlopen(f"{base}/health", timeout=2) as response:
+                      health = json.load(response)
+                  break
+              except (URLError, TimeoutError):
+                  time.sleep(1)
+          else:
+              raise SystemExit("FAIL: Kubernetes API did not become reachable")
+
+          assert health["status"] == "ok", health
+          assert health["model_sha"] == expected, health
+
+          customer = {
+              "alder": 35,
+              "region": "Stockholm",
+              "abonnemang": "Standard",
+              "manader_som_kund": 12,
+              "manadskostnad": 299.0,
+              "data_gb_per_manad": 20.0,
+              "supportarenden_12m": 2,
+          }
+          request = Request(
+              f"{base}/predict",
+              data=json.dumps(customer).encode(),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urlopen(request, timeout=10) as response:
+              prediction = json.load(response)
+
+          probability = prediction["churn_probability"]
+          assert math.isfinite(probability) and 0 <= probability <= 1, prediction
+          assert prediction["model_sha"] == expected, prediction
+          print(json.dumps(prediction))
+          print("PASS: Staging responds with the expected model version")
+          PY
+
+      - name: Show Kubernetes diagnostics
+        if: failure()
+        run: |
+          kubectl --context kind-staging get pods -o wide || true
+          kubectl --context kind-staging describe deployment saldes || true
+          kubectl --context kind-staging get events --sort-by=.metadata.creationTimestamp || true
+          kubectl --context kind-staging logs -l app=saldes --all-containers=true --tail=100 --prefix=true || true
+
+
   ringlista:
     name: Generate call list
     needs: utvardera
@@ -399,6 +506,7 @@ jobs:
       - utvardera
       - docker
       - image_manifest
+      - staging
 
     steps:
       - name: Kontrollera pipeline-resultat
@@ -411,6 +519,7 @@ jobs:
           EVAL_RESULT: ${{ needs.utvardera.result }}
           DOCKER_RESULT: ${{ needs.docker.result }}
           MANIFEST_RESULT: ${{ needs.image_manifest.result }}
+          STAGING_RESULT: ${{ needs.staging.result }}
           PUBLISH_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
@@ -437,6 +546,11 @@ jobs:
 
           if [[ "$PUBLISH_REQUIRED" == "true" && "$MANIFEST_RESULT" != "success" ]]; then
             echo "Publiceringen av imagen för båda plattformarna misslyckades."
+            exit 1
+          fi
+
+          if [[ "$PUBLISH_REQUIRED" == "true" && "$STAGING_RESULT" != "success" ]]; then
+            echo "Utrullningen i kind misslyckades."
             exit 1
           fi
 

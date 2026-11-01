@@ -1,0 +1,179 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_sha:
+        description: "Full commit SHA from a successful CI run on main"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+# Production deployments must not run at the same time.
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify approved model version
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    outputs:
+      model_sha: ${{ steps.version.outputs.model_sha }}
+
+    steps:
+      - name: Validate commit SHA
+        id: version
+        env:
+          MODEL_SHA: ${{ inputs.model_sha }}
+        run: |
+          if [[ ! "$MODEL_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Enter the complete 40-character commit SHA."
+            exit 1
+          fi
+          echo "model_sha=$MODEL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check successful CI and staging deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_SHA: ${{ steps.version.outputs.model_sha }}
+        run: |
+          RUN_ID=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$MODEL_SHA" \
+            -f status=success \
+            --jq '.workflow_runs[0].id // empty')
+
+          if [[ -z "$RUN_ID" ]]; then
+            echo "FAIL: No successful CI push run on main for this SHA."
+            exit 1
+          fi
+
+          STAGING_RESULT=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | select(.name == "Deploy to kind (staging)") | .conclusion')
+
+          if [[ "$STAGING_RESULT" != "success" ]]; then
+            echo "FAIL: This version has not passed the kind staging deployment."
+            exit 1
+          fi
+
+          echo "PASS: CI and staging succeeded for $MODEL_SHA"
+          echo "CI run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$RUN_ID"
+
+  deploy:
+    name: Deploy to the school cluster
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    # GitHub pauses this job until the environment reviewer approves it.
+    environment:
+      name: production
+      url: https://alessandro-abbate.89-167-53-206.sslip.io
+
+    env:
+      MODEL_SHA: ${{ needs.verify.outputs.model_sha }}
+      NAMESPACE: alessandro-abbate
+      CONTEXT: mlops-ht26
+      REPOSITORY: ${{ github.repository }}
+
+    steps:
+      # Use manifests from the same commit that passed CI.
+      - name: Checkout the approved version
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.model_sha }}
+
+      - name: Configure school cluster credentials
+        env:
+          KUBECONFIG_CONTENT: ${{ secrets.KUBECONFIG }}
+        run: |
+          KUBECONFIG="$RUNNER_TEMP/school-kubeconfig.yaml"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
+
+          if [[ -z "$KUBECONFIG_CONTENT" ]]; then
+            echo "FAIL: The KUBECONFIG secret is missing."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$KUBECONFIG_CONTENT" > "$KUBECONFIG"
+
+      - name: Deploy the approved image
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}:$MODEL_SHA"
+
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" set image --local \
+            -f k8s/deployment.yaml api="$IMAGE" -o yaml \
+            | kubectl --context "$CONTEXT" -n "$NAMESPACE" apply -f -
+
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" apply \
+            -f k8s/service.yaml -f k8s/ingress.yaml
+
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" rollout status \
+            deployment/saldes --timeout=180s
+
+      - name: Verify the deployed API
+        env:
+          BASE_URL: https://alessandro-abbate.89-167-53-206.sslip.io
+        run: |
+          # The course ingress currently uses a staging TLS certificate.
+          curl --insecure --fail --silent --show-error \
+            --retry 5 --retry-delay 2 --retry-all-errors --max-time 15 \
+            "$BASE_URL/health" -o "$RUNNER_TEMP/health.json"
+
+          curl --insecure --fail --silent --show-error \
+            --retry 5 --retry-delay 2 --retry-all-errors --max-time 15 \
+            "$BASE_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{"alder":35,"region":"Stockholm","abonnemang":"Standard","manader_som_kund":12,"manadskostnad":299.0,"data_gb_per_manad":20.0,"supportarenden_12m":2}' \
+            -o "$RUNNER_TEMP/prediction.json"
+
+          python - <<'PY'
+          import json
+          import math
+          import os
+          from pathlib import Path
+
+          folder = Path(os.environ["RUNNER_TEMP"])
+          health = json.loads((folder / "health.json").read_text())
+          prediction = json.loads((folder / "prediction.json").read_text())
+          expected = os.environ["MODEL_SHA"]
+
+          assert health["status"] == "ok", health
+          assert health["model_sha"] == expected, health
+          assert prediction["model_sha"] == expected, prediction
+          probability = prediction["churn_probability"]
+          assert math.isfinite(probability) and 0 <= probability <= 1, prediction
+
+          print(json.dumps(health))
+          print(json.dumps(prediction))
+          print("PASS: The school cluster serves the approved model version")
+          PY
+
+      - name: Show Kubernetes diagnostics
+        if: failure()
+        run: |
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" get pods -o wide || true
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" get events --sort-by=.metadata.creationTimestamp || true
+          kubectl --context "$CONTEXT" -n "$NAMESPACE" logs -l app=saldes --all-containers=true --tail=100 --prefix=true || true
+
+      - name: Write deployment summary
+        run: |
+          echo "## Production deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "Model commit: $MODEL_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Namespace: $NAMESPACE" >> "$GITHUB_STEP_SUMMARY"
+          echo "Health and prediction checks passed." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove cluster credentials
+        if: always()
+        run: rm -f "$KUBECONFIG"
