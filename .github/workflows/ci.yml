@@ -190,9 +190,18 @@ jobs:
           fi
 
   docker:
-    name: Build and smoke-test Docker image
+    name: Build and smoke-test Docker image (${{ matrix.arch }})
     needs: utvardera
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
 
     permissions:
       contents: read
@@ -202,6 +211,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Both architectures use the same approved model artifact.
       - name: Download approved model
         uses: actions/download-artifact@v4
         with:
@@ -231,13 +241,13 @@ jobs:
           print("PASS: Model commit matches workflow commit")
           PY
 
+      # Each runner builds for its own architecture.
       - name: Build Docker image
         run: docker build -t churn-docker:ci .
 
       - name: Run Docker smoke-test
         run: bash scripts/smoke_test.sh churn-docker:ci
 
-      # Verify the HTTP service before publishing the image.
       - name: Run API smoke-test
         run: bash scripts/smoke_test_api.sh churn-docker:ci
 
@@ -249,14 +259,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Separate tags prevent the two builds from overwriting each other.
       - name: Tag and publish approved image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
+          ARCH: ${{ matrix.arch }}
         run: |
           IMAGE="ghcr.io/${REPOSITORY,,}"
-          TAG="$IMAGE:$COMMIT_SHA"
+          TAG="$IMAGE:$COMMIT_SHA-$ARCH"
 
           docker tag churn-docker:ci "$TAG"
           docker push "$TAG"
@@ -268,8 +280,9 @@ jobs:
         env:
           REPOSITORY: ${{ github.repository }}
           COMMIT_SHA: ${{ github.sha }}
+          ARCH: ${{ matrix.arch }}
         run: |
-          IMAGE="ghcr.io/${REPOSITORY,,}:$COMMIT_SHA"
+          IMAGE="ghcr.io/${REPOSITORY,,}:$COMMIT_SHA-$ARCH"
 
           docker image rm "$IMAGE"
           docker pull "$IMAGE"
@@ -277,6 +290,70 @@ jobs:
           bash scripts/smoke_test_api.sh "$IMAGE"
 
           echo "PASS: Published image pulled and verified"
+
+  image_manifest:
+    name: Publish multi-platform image
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The common SHA tag points to both tested platform images.
+      - name: Create multi-platform image tag
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:$COMMIT_SHA" \
+            "$IMAGE:$COMMIT_SHA-amd64" \
+            "$IMAGE:$COMMIT_SHA-arm64"
+
+      - name: Verify published platforms
+        env:
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE="ghcr.io/${REPOSITORY,,}:$COMMIT_SHA"
+
+          docker buildx imagetools inspect "$IMAGE"
+          docker buildx imagetools inspect --raw "$IMAGE" > image-manifest.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          manifest = json.loads(Path("image-manifest.json").read_text())
+          platforms = {
+              (
+                  item.get("platform", {}).get("os"),
+                  item.get("platform", {}).get("architecture"),
+              )
+              for item in manifest.get("manifests", [])
+          }
+
+          required = {("linux", "amd64"), ("linux", "arm64")}
+          if not required.issubset(platforms):
+              raise SystemExit(f"Missing required platforms: {platforms}")
+
+          print("PASS: Published image supports linux/amd64 and linux/arm64")
+          PY
 
   ringlista:
     name: Generate call list
@@ -321,6 +398,7 @@ jobs:
       - train
       - utvardera
       - docker
+      - image_manifest
 
     steps:
       - name: Kontrollera pipeline-resultat
@@ -332,6 +410,8 @@ jobs:
           TRAIN_RESULT: ${{ needs.train.result }}
           EVAL_RESULT: ${{ needs.utvardera.result }}
           DOCKER_RESULT: ${{ needs.docker.result }}
+          MANIFEST_RESULT: ${{ needs.image_manifest.result }}
+          PUBLISH_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           if [[ "$CHANGES_RESULT" != "success" ]]; then
             echo "Ändringskontrollen misslyckades."
@@ -354,5 +434,10 @@ jobs:
               exit 1
             fi
           done
+
+          if [[ "$PUBLISH_REQUIRED" == "true" && "$MANIFEST_RESULT" != "success" ]]; then
+            echo "Publiceringen av imagen för båda plattformarna misslyckades."
+            exit 1
+          fi
 
           echo "Alla obligatoriska CI-jobb passerade."
