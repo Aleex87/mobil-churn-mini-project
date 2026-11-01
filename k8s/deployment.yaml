@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: ghcr.io/aleex87/mobil-churn-mini-project:994b365a92924c34ac0172557b1ad28b2c23b3a7
+          image: ghcr.io/aleex87/mobil-churn-mini-project:b84a491f4ab8ab8cb6a2202e38f13f2a29fc3246
           imagePullPolicy: IfNotPresent
 
           ports:
