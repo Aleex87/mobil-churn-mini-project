@@ -264,4 +264,20 @@ Return to the local Kubernetes configuration:
 unset KUBECONFIG
 kubectl config current-context
 ```
+## Operations and drift plan
+
+This is a proposed plan. No monitoring system has been implemented.
+
+- Invalid data: any Pandera error stops the pipeline. Fix the data and keep the deployed model.
+- Data drift: check customer data weekly. A change of 10 percentage points in a subscription category, compared with training data, triggers an investigation.
+- Model quality: compare predictions with actual customer outcomes. If ROC AUC falls below 0.70, investigate and consider retraining.
+- API errors: if more than 5% of requests return server errors over 5 minutes, inspect logs and pods. Roll back if the new release caused the problem.
+
+Operational thresholds are starting points and need validation with real traffic and sufficient samples.
+Data drift means the input data has changed. Concept drift means the relationship between customer features and churn has changed.
+The /health endpoint checks service health, not prediction quality.
+
+New models must pass CI, staging and manual approval.
+Roll back only when the previous version is a better working option.
+
 AI was used as a support tool during the development of this project.
