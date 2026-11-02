@@ -79,7 +79,7 @@ jobs:
     # GitHub pauses this job until the environment reviewer approves it.
     environment:
       name: production
-      url: https://alessandro-abbate.89-167-53-206.sslip.io
+      url: https://alessandro-abbate.89-167-53-206.sslip.io/docs
 
     env:
       MODEL_SHA: ${{ needs.verify.outputs.model_sha }}

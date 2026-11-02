@@ -34,7 +34,8 @@ def bygg_modell() -> Pipeline:
     return Pipeline(
         [
             ("forbehandling", forbehandling),
-            ("klassificerare", LogisticRegression(max_iter=1000, random_state=SEED)),
+            # Change C for the second model version (default C is 1.0).
+            ("klassificerare", LogisticRegression(C=0.5, max_iter=1000, random_state=SEED)),
         ]
     )
 
@@ -79,6 +80,8 @@ def main(utkatalog: Path = Path("outputs")) -> None:
             "random_state": SEED,
             "test_size": 0.25,
             "max_iter": modell.named_steps["klassificerare"].max_iter,
+            # Compare model versions in MLflow.
+            "C": modell.named_steps["klassificerare"].C,
         })
         mlflow.log_metrics({
             "roc_auc": matvarden["roc_auc"],
